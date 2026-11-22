@@ -141,6 +141,113 @@ func TestSharedScheduleSharesPrivateSkillAndPreservesStoredFiles(t *testing.T) {
 	}
 }
 
+func TestSharedScheduleSharesDirectSOPAgentDependencies(t *testing.T) {
+	st, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	check := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(st.PutRule(domain.RuleDefinition{ID: "sop-role-rule", Name: "Role rule", ProjectID: "source"}))
+	check(st.PutSkill(domain.SkillDefinition{ID: "sop-role-skill", Name: "Role skill", ProjectID: "source"}))
+	check(st.PutAgent(domain.AgentDefinition{
+		ID: "sop-role", Name: "SOP role", ProjectID: "source",
+		Rules: []string{"sop-role-rule"}, Skills: []string{"sop-role-skill"},
+	}))
+	check(st.PutSandbox(domain.SandboxProfile{ID: "shared-sop-sandbox", Name: "Shared sandbox", ProjectID: "source", Shared: true, Driver: domain.SandboxDriverNative}))
+	check(st.PutWorkflow(domain.WorkflowDefinition{
+		ID: "sop-with-role", Name: "SOP with role", ProjectID: "source",
+		SandboxProfileID: "shared-sop-sandbox",
+		Nodes:            []domain.WorkflowNode{{ID: "role", Name: "Role", Type: "agent", AgentID: "sop-role"}},
+	}))
+	job := domain.ScheduleJob{
+		ID: "sop-role-job", Name: "SOP role job", ProjectID: "source", SkipDispatch: true,
+		AssistantPrompt: "inspect", References: []domain.AssistantReference{{Type: "sop", ID: "sop-with-role"}},
+	}
+	check(st.PutScheduleJob(job))
+
+	v, err := st.PublishSharedSchedule(job.ID, job.ProjectID, domain.SharedScheduleVersion{Name: "Shared", Prompt: "inspect"}, 0)
+	check(err)
+	if !v.HasAsset("sop", "sop-with-role") || len(v.Assets) != 1 {
+		t.Fatalf("publication expanded nested dependencies: %+v", v.Assets)
+	}
+	role, _ := st.Agent("sop-role")
+	rule, _ := st.Rule("sop-role-rule")
+	skill, _ := st.Skill("sop-role-skill")
+	if !role.Shared || !rule.Shared || !skill.Shared {
+		t.Fatalf("direct SOP role dependencies were not delegated to role sharing: role=%v rule=%v skill=%v", role.Shared, rule.Shared, skill.Shared)
+	}
+}
+
+func TestSharedScheduleSOPDoesNotShareRoleWhenSandboxValidationFails(t *testing.T) {
+	st, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.PutAgent(domain.AgentDefinition{ID: "blocked-sop-role", Name: "Blocked role", ProjectID: "source"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSandbox(domain.SandboxProfile{ID: "private-sop-sandbox", Name: "Private sandbox", ProjectID: "source", Driver: domain.SandboxDriverNative}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutWorkflow(domain.WorkflowDefinition{
+		ID: "blocked-sop", Name: "Blocked SOP", ProjectID: "source", SandboxProfileID: "private-sop-sandbox",
+		Nodes: []domain.WorkflowNode{{ID: "role", Name: "Role", Type: "agent", AgentID: "blocked-sop-role"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job := domain.ScheduleJob{ID: "blocked-sop-job", Name: "Blocked SOP job", ProjectID: "source", SkipDispatch: true, AssistantPrompt: "inspect", References: []domain.AssistantReference{{Type: "sop", ID: "blocked-sop"}}}
+	if err := st.PutScheduleJob(job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PublishSharedSchedule(job.ID, job.ProjectID, domain.SharedScheduleVersion{Name: "Blocked", Prompt: "inspect"}, 0); err == nil {
+		t.Fatal("private sandbox was accepted")
+	}
+	role, _ := st.Agent("blocked-sop-role")
+	workflow, _ := st.Workflow("blocked-sop")
+	if role.Shared || workflow.Shared {
+		t.Fatalf("failed publication partially shared dependencies: role=%v workflow=%v", role.Shared, workflow.Shared)
+	}
+}
+
+func TestSharedScheduleRejectsPrivateForeignSOPRole(t *testing.T) {
+	st, err := OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.PutAgent(domain.AgentDefinition{ID: "foreign-sop-role", Name: "Foreign role", ProjectID: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSandbox(domain.SandboxProfile{ID: "foreign-role-sandbox", Name: "Shared sandbox", ProjectID: "source", Shared: true, Driver: domain.SandboxDriverNative}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutWorkflow(domain.WorkflowDefinition{
+		ID: "foreign-role-sop", Name: "Foreign role SOP", ProjectID: "source", SandboxProfileID: "foreign-role-sandbox",
+		Nodes: []domain.WorkflowNode{{ID: "role", Name: "Role", Type: "agent", AgentID: "foreign-sop-role"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job := domain.ScheduleJob{ID: "foreign-role-job", Name: "Foreign role job", ProjectID: "source", SkipDispatch: true, AssistantPrompt: "inspect", References: []domain.AssistantReference{{Type: "sop", ID: "foreign-role-sop"}}}
+	if err := st.PutScheduleJob(job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PublishSharedSchedule(job.ID, job.ProjectID, domain.SharedScheduleVersion{Name: "Blocked", Prompt: "inspect"}, 0); err == nil {
+		t.Fatal("private foreign role was accepted")
+	}
+	role, _ := st.Agent("foreign-sop-role")
+	workflow, _ := st.Workflow("foreign-role-sop")
+	if role.Shared || workflow.Shared {
+		t.Fatalf("failed publication changed private foreign role or SOP: role=%v workflow=%v", role.Shared, workflow.Shared)
+	}
+}
+
 func TestSharedScheduleCanonicalReferencesAndOwnership(t *testing.T) {
 	st, err := OpenTest()
 	if err != nil {

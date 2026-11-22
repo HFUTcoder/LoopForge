@@ -46,6 +46,44 @@ func TestSharedScheduleUsesNormalProjectAssetResolution(t *testing.T) {
 	}
 }
 
+func TestSharedScheduleSOPDirectRoleIsUsableBySubscriber(t *testing.T) {
+	st, err := repo.OpenTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	check := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(st.PutAgent(domain.AgentDefinition{ID: "subscriber-sop-role", Name: "Subscriber SOP role", ProjectID: "source"}))
+	check(st.PutSandbox(domain.SandboxProfile{ID: "subscriber-sop-sandbox", Name: "Subscriber SOP sandbox", ProjectID: "source", Shared: true, Driver: domain.SandboxDriverNative}))
+	check(st.PutWorkflow(domain.WorkflowDefinition{
+		ID: "subscriber-sop", Name: "Subscriber SOP", ProjectID: "source", SandboxProfileID: "subscriber-sop-sandbox",
+		Nodes: []domain.WorkflowNode{{ID: "role", Name: "Role", Type: "agent", AgentID: "subscriber-sop-role"}},
+	}))
+	job := domain.ScheduleJob{
+		ID: "subscriber-sop-job", Name: "Subscriber SOP job", ProjectID: "source", SkipDispatch: true,
+		AssistantPrompt: "inspect", References: []domain.AssistantReference{{Type: "sop", ID: "subscriber-sop"}},
+	}
+	check(st.PutScheduleJob(job))
+	v, err := st.PublishSharedSchedule(job.ID, job.ProjectID, domain.SharedScheduleVersion{Name: "Shared", Prompt: "inspect"}, 0)
+	check(err)
+	role, _ := st.Agent("subscriber-sop-role")
+	if !role.Shared {
+		t.Fatal("direct SOP role was not shared")
+	}
+
+	e := New(st, runtime.NewManager(filepath.Join(t.TempDir(), "workspaces")))
+	e.ConfigureExecution("test", "test", time.Second, false)
+	exec := domain.TelemetryContext{ProjectID: "target", ResponsibleUserID: 42, SharedScheduleID: v.ID, SharedScheduleVersion: v.Version}
+	if _, err := e.StartWithRepositoriesContext("subscriber-sop", "inspect", nil, exec); err != nil {
+		t.Fatalf("subscriber could not start SOP with its direct role dependency: %v", err)
+	}
+}
+
 func TestSharedScheduleNestedSOPUsesImmediateParentBinding(t *testing.T) {
 	st, err := repo.OpenTest()
 	if err != nil {

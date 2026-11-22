@@ -116,6 +116,47 @@ func (r *CatalogRepo) ValidateWorkflowSharing(v domain.WorkflowDefinition) error
 	return nil
 }
 
+// workflowDirectAgentIDs returns only the roles bound directly to workflow
+// nodes. The role's own sharing path owns any assets bound to that role.
+func workflowDirectAgentIDs(v domain.WorkflowDefinition) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, node := range v.Nodes {
+		if node.Type != "agent" || domain.IsPreviewBuildAgent(node.AgentID) {
+			continue
+		}
+		id := strings.TrimSpace(node.AgentID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// shareWorkflowAgents delegates each direct role dependency to the role's
+// sharing path. Nested role assets remain owned by ShareAgent.
+func (r *CatalogRepo) shareWorkflowAgents(v domain.WorkflowDefinition) error {
+	projectID := strings.TrimSpace(v.ProjectID)
+	for _, id := range workflowDirectAgentIDs(v) {
+		agent, ok := r.Agent(id)
+		if !ok {
+			return fmt.Errorf("角色 %q 不存在", id)
+		}
+		if strings.TrimSpace(agent.ProjectID) != projectID || agent.Shared {
+			continue
+		}
+		if err := r.ShareAgent(id); err != nil {
+			return fmt.Errorf("共享 SOP 直接引用的角色 %q 失败：%w", agent.Name, err)
+		}
+	}
+	return nil
+}
+
 // ShareWorkflow applies SOP sharing checks before the ordinary save path,
 // including its existing notification and revision validation.
 func (r *CatalogRepo) ShareWorkflow(id string) error {
@@ -131,6 +172,9 @@ func (r *CatalogRepo) ShareWorkflow(id string) error {
 		return err
 	}
 	if err := r.ValidateWorkflowSharing(v); err != nil {
+		return err
+	}
+	if err := r.shareWorkflowAgents(v); err != nil {
 		return err
 	}
 	return r.PutWorkflow(v)
